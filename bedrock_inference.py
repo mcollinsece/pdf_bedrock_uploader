@@ -19,189 +19,179 @@ class PDFProcessingError(Exception):
     """Custom exception for PDF processing errors"""
     pass
 
-# Initialize AWS clients
-def init_aws_clients():
-    """Initialize AWS clients with error handling"""
-    try:
-        return {
-            's3_client': boto3.client('s3'),
-            'bedrock': boto3.client('bedrock-runtime')
-        }
-    except Exception as e:
-        logger.error(f"Failed to initialize AWS clients: {str(e)}")
-        raise
+class PDFProcessor:
+    def __init__(self):
+        """Initialize with empty configuration"""
+        self.input_bucket = None
+        self.input_key = None
+        self.uuid = None
+        self.s3_client = boto3.client('s3')
+        self.bedrock_client = boto3.client('bedrock-runtime')
 
-# Configuration
-def get_config():
-    """Get configuration from environment variables"""
-    return {
-        'input_bucket': os.environ.get('INPUT_BUCKET'),
-        'uuid': os.environ.get('UUID'),
-        'input_key': os.environ.get('INPUT_KEY'),
-        'local_input': '/tmp/pdf_file.pdf'
-    }
+    # ✅ Set input bucket & key
+    def set_input(self, bucket: str, key: str):
+        """Set the input S3 bucket and file key"""
+        self.input_bucket = bucket
+        self.input_key = key
 
-def pdf_to_base64_images(pdf_data: bytes):
-    """
-    Converts each page of a PDF into a Base64-encoded image string.
-    
-    :param pdf_data: PDF file as binary data.
-    :return: List of Base64-encoded image strings (one per page).
-    """
-    try:
-        images = convert_from_bytes(pdf_data, dpi=300)  # Render PDF pages as images
-        base64_images = []
+    # ✅ Set UUID for tracking results
+    def set_uuid(self, uuid: str):
+        """Set UUID for result storage"""
+        self.uuid = uuid
 
-        for img in images:
-            # Convert image to Base64
-            img_buffer = io.BytesIO()
-            img.save(img_buffer, format="PNG")  # Save as PNG
-            base64_str = base64.b64encode(img_buffer.getvalue()).decode("utf-8")
+    def pdf_to_base64_images(self, pdf_data: bytes):
+        """
+        Converts each page of a PDF into a Base64-encoded image string.
+        :param pdf_data: PDF file as binary data.
+        :return: List of Base64-encoded image strings (one per page).
+        """
+        try:
+            images = convert_from_bytes(pdf_data, dpi=300)  # Convert PDF pages to images
+            base64_images = []
 
-            base64_images.append(base64_str)
+            for img in images:
+                img_buffer = io.BytesIO()
+                img.save(img_buffer, format="PNG")  # Save as PNG
+                base64_str = base64.b64encode(img_buffer.getvalue()).decode("utf-8")
+                base64_images.append(base64_str)
 
-        return base64_images
-    except Exception as e:
-        logger.error(f"Error processing PDF: {str(e)}")
-        raise PDFProcessingError(f"Failed to convert PDF to images: {str(e)}")
+            return base64_images
+        except Exception as e:
+            logger.error(f"Error processing PDF: {str(e)}")
+            raise PDFProcessingError(f"Failed to convert PDF to images: {str(e)}")
 
-def prepare_bedrock_payload(pdf_base64_images):
-    """
-    Prepare the payload for Bedrock inference with multiple page images.
-    
-    :param pdf_base64_images: List of Base64-encoded PDF page images.
-    :return: Formatted payload for Bedrock.
-    """
-    try:
-        if not pdf_base64_images:
-            raise ValueError("No valid Base64 images found in PDF")
+    def prepare_bedrock_payload(self, pdf_base64_images):
+        """
+        Prepare the payload for Bedrock inference with multiple page images.
+        :param pdf_base64_images: List of Base64-encoded PDF page images.
+        :return: Formatted payload for Bedrock.
+        """
+        try:
+            if not pdf_base64_images:
+                raise ValueError("No valid Base64 images found in PDF")
 
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Analyze this document and summarize the content."}
-                ]
+            messages = [{"role": "user", "content": [{"type": "text", "text": "Analyze this document and summarize the content."}]}]
+
+            # Attach all pages as Base64 images
+            for img_str in pdf_base64_images:
+                messages[0]["content"].append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": img_str
+                    }
+                })
+
+            return {
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 2048,
+                "messages": messages
             }
-        ]
+        except (AttributeError, ValueError) as e:
+            logger.error(f"Error preparing Bedrock payload: {str(e)}")
+            raise PDFProcessingError(f"Failed to prepare PDF payload: {str(e)}")
 
-        # Attach all pages as Base64 images
-        for img_str in pdf_base64_images:
-            messages[0]["content"].append({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": "image/png",
-                    "data": img_str
-                }
-            })
+    def write_results_to_s3(self, results):
+        """
+        Write processing results to S3.
+        :param results: Processing results to write.
+        """
+        if not self.input_bucket or not self.input_key or not self.uuid:
+            raise PDFProcessingError("S3 bucket, input key, or UUID is not set.")
 
-        return {
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 2048,
-            "messages": messages
-        }
-    except (AttributeError, ValueError) as e:
-        logger.error(f"Error preparing Bedrock payload: {str(e)}")
-        raise PDFProcessingError(f"Failed to prepare PDF payload: {str(e)}")
+        output_key = f"pdf_results/{self.uuid}/{os.path.splitext(os.path.basename(self.input_key))[0]}_results.json"
 
-def write_results_to_s3(s3_client, results, bucket, key):
-    """
-    Write processing results to S3.
-    
-    :param s3_client: Boto3 S3 client.
-    :param results: Processing results to write.
-    :param bucket: Destination bucket.
-    :param key: Destination key.
-    """
-    try:
-        s3_client.put_object(
-            Bucket=bucket,
-            Key=key,
-            Body=json.dumps(results, indent=2),
-            ContentType='application/json'
-        )
-    except ClientError as e:
-        logger.error(f"Failed to write results to S3: {str(e)}")
-        raise PDFProcessingError(f"S3 write error: {str(e)}")
+        try:
+            self.s3_client.put_object(
+                Bucket=self.input_bucket,
+                Key=output_key,
+                Body=json.dumps(results, indent=2),
+                ContentType='application/json'
+            )
+            logger.info(f"Results saved to s3://{self.input_bucket}/{output_key}")
+        except ClientError as e:
+            logger.error(f"Failed to write results to S3: {str(e)}")
+            raise PDFProcessingError(f"S3 write error: {str(e)}")
 
-def read_pdf_from_s3(s3_client, config):
-    """Download PDF file from S3."""
-    try:
-        logger.info(f"Downloading PDF from s3://{config['input_bucket']}/{config['input_key']}")
-        response = s3_client.get_object(
-            Bucket=config['input_bucket'],
-            Key=config['input_key']
-        )
-        return response['Body'].read()
-    except ClientError as e:
-        logger.error(f"Error downloading PDF: {e}")
-        raise PDFProcessingError(f"Failed to read PDF from S3: {str(e)}")
+    def read_pdf_from_s3(self):
+        """Download PDF file from S3."""
+        if not self.input_bucket or not self.input_key:
+            raise PDFProcessingError("S3 bucket or input key is not set.")
 
-def process_pdf():
-    """
-    Process a single PDF and analyze it using Bedrock.
-    """
-    start_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+        try:
+            logger.info(f"Downloading PDF from s3://{self.input_bucket}/{self.input_key}")
+            response = self.s3_client.get_object(Bucket=self.input_bucket, Key=self.input_key)
+            return response['Body'].read()
+        except ClientError as e:
+            logger.error(f"Error downloading PDF: {e}")
+            raise PDFProcessingError(f"Failed to read PDF from S3: {str(e)}")
 
-    try:
-        # Initialize AWS clients
-        aws_clients = init_aws_clients()
-        config = get_config()
+    def process(self):
+        """
+        Process a single PDF and analyze it using Bedrock.
+        """
+        if not self.input_bucket or not self.input_key or not self.uuid:
+            raise PDFProcessingError("Missing required parameters: input_bucket, input_key, or uuid.")
 
-        # Read input PDF
-        pdf_data = read_pdf_from_s3(aws_clients['s3_client'], config)
-        if not pdf_data:
-            raise PDFProcessingError("No PDF data received from S3")
+        start_time = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        # Convert PDF to Base64 images
-        pdf_base64_images = pdf_to_base64_images(pdf_data)
+        try:
+            # Read input PDF
+            pdf_data = self.read_pdf_from_s3()
+            if not pdf_data:
+                raise PDFProcessingError("No PDF data received from S3")
 
-        # Prepare and call Bedrock
-        logger.info(f"Calling Bedrock inference")
-        bedrock_payload = prepare_bedrock_payload(pdf_base64_images)
+            # Convert PDF to Base64 images
+            pdf_base64_images = self.pdf_to_base64_images(pdf_data)
 
-        response = aws_clients['bedrock'].invoke_model(
-            modelId='anthropic.claude-3.5-sonnet-20240620-v1:0',
-            body=json.dumps(bedrock_payload)
-        )
+            # Prepare and call Bedrock
+            logger.info(f"Calling Bedrock inference")
+            bedrock_payload = self.prepare_bedrock_payload(pdf_base64_images)
 
-        # Process results
-        inference_results = json.loads(response['body'].read().decode("utf-8"))
+            response = self.bedrock_client.invoke_model(
+                modelId='anthropic.claude-3.5-sonnet-20240620-v1:0',
+                body=json.dumps(bedrock_payload)
+            )
 
-        # Prepare final results
-        results = {
-            'pdf_key': config['input_key'],
-            'processing_start_time': start_time,
-            'processing_end_time': datetime.now().strftime("%Y%m%d_%H%M%S"),
-            'status': 'SUCCESS',
-            'analysis_results': inference_results
-        }
+            # Process results
+            inference_results = json.loads(response['body'].read().decode("utf-8"))
 
-        # Write results
-        output_key = os.path.join(
-            "pdf_results",
-            config['uuid'],
-            f"{os.path.splitext(os.path.basename(config['input_key']))[0]}_results.json"
-        )
-        
-        logger.info(f"Writing results to {output_key} in bucket {config['input_bucket']}")
-        write_results_to_s3(aws_clients['s3_client'], results, config['input_bucket'], output_key)
+            # Prepare final results
+            results = {
+                'pdf_key': self.input_key,
+                'processing_start_time': start_time,
+                'processing_end_time': datetime.now().strftime("%Y%m%d_%H%M%S"),
+                'status': 'SUCCESS',
+                'analysis_results': inference_results
+            }
 
-        return results
+            # Write results
+            self.write_results_to_s3(results)
 
-    except Exception as e:
-        logger.error(f"Error processing PDF {config['input_key']}:", exc_info=True)
-        error_response = {
-            'pdf_key': config['input_key'],
-            'processing_start_time': start_time,
-            'processing_end_time': datetime.now().strftime("%Y%m%d_%H%M%S"),
-            'status': 'FAILED',
-            'error': str(e),
-            'error_type': type(e).__name__
-        }
-        return error_response
+            return results
+
+        except Exception as e:
+            logger.error(f"Error processing PDF {self.input_key}:", exc_info=True)
+            error_response = {
+                'pdf_key': self.input_key,
+                'processing_start_time': start_time,
+                'processing_end_time': datetime.now().strftime("%Y%m%d_%H%M%S"),
+                'status': 'FAILED',
+                'error': str(e),
+                'error_type': type(e).__name__
+            }
+            return error_response
+
 
 if __name__ == "__main__":
-    result = process_pdf()
+    # Example Usage
+    processor = PDFProcessor()
+
+    # Set values dynamically instead of using env variables
+    processor.set_input("your-input-bucket", "documents/sample.pdf")
+    processor.set_uuid("123456")
+
+    # Process PDF and analyze with Bedrock
+    result = processor.process()
     logger.info(f"Processing complete: {result}")
