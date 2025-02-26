@@ -28,13 +28,13 @@ class PDFProcessor:
         self.s3_client = boto3.client('s3')
         self.bedrock_client = boto3.client('bedrock-runtime')
 
-    # ✅ Set input bucket & key
+    #Set input bucket & key
     def set_input(self, bucket: str, key: str):
         """Set the input S3 bucket and file key"""
         self.input_bucket = bucket
         self.input_key = key
 
-    # ✅ Set UUID for tracking results
+    #Set UUID for tracking results
     def set_uuid(self, uuid: str):
         """Set UUID for result storage"""
         self.uuid = uuid
