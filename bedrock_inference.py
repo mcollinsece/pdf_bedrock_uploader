@@ -5,7 +5,7 @@ import logging
 import datetime
 import base64
 import io
-from pdf2image import convert_from_bytes
+import fitz  # PyMuPDF
 from PIL import Image
 from botocore.exceptions import ClientError
 from typing import Dict, Any, Union
@@ -46,13 +46,20 @@ class PDFProcessor:
         :return: List of Base64-encoded image strings (one per page).
         """
         try:
-            images = convert_from_bytes(pdf_data, dpi=300)  # Convert PDF pages to images
+            # Load PDF from bytes using fitz (PyMuPDF)
+            doc = fitz.open(stream=pdf_data, filetype="pdf")
             base64_images = []
 
-            for img in images:
+            for page_num in range(len(doc)):
+                # Render page to an image
+                pix = doc[page_num].get_pixmap(dpi=300)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+                # Convert image to Base64
                 img_buffer = io.BytesIO()
                 img.save(img_buffer, format="PNG")  # Save as PNG
                 base64_str = base64.b64encode(img_buffer.getvalue()).decode("utf-8")
+
                 base64_images.append(base64_str)
 
             return base64_images
